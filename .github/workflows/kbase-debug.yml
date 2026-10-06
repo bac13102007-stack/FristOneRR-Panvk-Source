@@ -1,122 +1,66 @@
----
-name: PanVK kbase debug Mesa
-
-'on':
-  push:
-  pull_request:
+--name: Build PanVK for G710
+on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
-  build-kbase-debug:
-    name: Build PanVK kbase debug Mesa
-    runs-on: ubuntu-24.04-arm
-    container:
-      image: debian:13
-    env:
-      ARTIFACT_NAME: mesa-panvk-kbase-debug-aarch64
-      BUILD_DIR: build
-      INSTALL_PREFIX: /opt/mesa
+  build:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Get my source code
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install build tools
         run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            --no-install-recommends \
-            bison \
-            build-essential \
-            ca-certificates \
-            flex \
-            libdrm-dev \
-            libelf-dev \
-            libexpat1-dev \
-            libclang-cpp-dev \
-            libclang-dev \
-            libwayland-dev \
-            libwayland-egl-backend-dev \
-            ninja-build \
-            pkgconf \
-            python3 \
-            python3-mako \
-            python3-packaging \
-            python3-pip \
-            python3-setuptools \
-            python3-yaml \
-            llvm-dev \
-            glslang-tools \
-            spirv-tools \
-            wayland-protocols \
-            zlib1g-dev \
-            zip
-          LLVM_MAJOR="$(llvm-config --version | cut -d. -f1)"
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            --no-install-recommends \
-            "libclc-${LLVM_MAJOR}-dev" \
-            "libllvmspirvlib-${LLVM_MAJOR}-dev"
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build clang llvm-dev libclang-dev libclang-cpp-dev libelf-dev zlib1g-dev libzstd-dev pkg-config cmake python3-pip spirv-tools
+          pip3 install --break-system-packages mako pyyaml
 
-      - name: Install Meson
+      - name: Download Android NDK
         run: |
-          python3 -m pip install --break-system-packages \
-            'meson>=1.4.0,<2'
+          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q android-ndk-r27c-linux.zip
+          echo "$PWD/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
-      - name: Configure
+      - name: Build host shader compiler (mesa_clc)
         run: |
-          meson setup "${BUILD_DIR}" \
-            --buildtype=debug \
-            -Dprefix="${INSTALL_PREFIX}" \
-            -Dlibdir=lib \
-            -Dbuild-tests=false \
-            -Degl=enabled \
-            -Degl-native-platform=auto \
-            -Denable-glcpp-tests=false \
-            -Dgallium-drivers=panfrost \
-            -Dgbm=enabled \
-            -Dgles1=disabled \
-            -Dgles2=enabled \
-            -Dglx=disabled \
-            -Dllvm=enabled \
-            -Dopengl=false \
-            -Dpanfrost-kmds=kbase,panthor \
-            -Dplatforms=wayland \
-            -Dvalgrind=disabled \
-            -Dvulkan-drivers=panfrost \
-            -Dzstd=disabled
+          meson setup build-host \
+            -Dvulkan-drivers=panfrost -Dgallium-drivers= -Dplatforms= \
+            -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false \
+            -Dbuildtype=release
+          ninja -C build-host mesa_clc || ninja -C build-host src/util/mesa_clc
+          find build-host -name mesa_clc -type f
 
-      - name: Build
-        run: meson compile -C "${BUILD_DIR}" -j "$(nproc)"
-
-      - name: Install
+      - name: Prepare cross file for cloud machine
         run: |
-          rm -rf artifacts
-          mkdir -p artifacts/install-root
-          meson install -C "${BUILD_DIR}" \
-            --destdir "${GITHUB_WORKSPACE}/artifacts/install-root"
+          CLC=$(find "$PWD/build-host" -name mesa_clc -type f | head -n 1)
+          cat > ci-cross.txt <<EOF
+          [binaries]
+          c = ['clang', '--target=aarch64-linux-android35']
+          cpp = ['clang++', '--target=aarch64-linux-android35']
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          pkgconfig = 'pkg-config'
+          mesa_clc = '$CLC'
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8-a'
+          endian = 'little'
+          [built-in options]
+          [properties]
+          platform-sdk-version = '35'
+          EOF
 
-      - name: Create zip package
+      - name: Build the driver (tuned for Dimensity 9000+)
         run: |
-          cd "${GITHUB_WORKSPACE}/artifacts/install-root"
-          zip -r \
-            "${GITHUB_WORKSPACE}/${ARTIFACT_NAME}.zip" \
-            opt/mesa
+          OPTS=$(grep -v -- '-Dprecomp-compiler' tools/fristonerr/build-options.txt)
+          meson setup build-android --cross-file ci-cross.txt $OPTS \
+            --buildtype=release \
+            -Dc_args=-mcpu=cortex-a710 -Dcpp_args=-mcpu=cortex-a710
+          ninja -C build-android
 
-      - name: Upload Mesa package
+      - name: Save my driver
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ github.workspace }}/${{ env.ARTIFACT_NAME }}.zip
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload Meson logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARTIFACT_NAME }}-logs
-          path: ${{ github.workspace }}/build/meson-logs
-          if-no-files-found: ignore
-          retention-days: 7
+          name: panvk-g710-mybuild
+          path: build-android/src/panfrost/vulkan/libvulkan_panfrost.so
