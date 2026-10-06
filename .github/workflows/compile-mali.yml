@@ -1,0 +1,52 @@
+name: Build Custom Dimensity 9000+ Driver
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Codebase
+        uses: actions/checkout@v4
+
+      - name: Set Up Linux Building Toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build bison flex python3-mako libdrm-dev
+
+      - name: Clone Stable Mesa Engine
+        run: |
+          git clone -b mesa-24.0.0 --depth 1 https://freedesktop.org
+          cd mesa
+          mkdir -p src/vulkan/util/cutils
+          echo -e '#ifndef CUTILS_NATIVE_HANDLE_H\n#define CUTILS_NATIVE_HANDLE_H\ntypedef struct native_handle { int version; int numFds; int numInts; int data; } native_handle_t;\n#endif' > src/vulkan/util/cutils/native_handle.h
+
+      - name: Configure for Dimensity Core Layout
+        run: |
+          cd mesa
+          meson setup build-android \
+            -Dgallium-va=disabled \
+            -Dgallium-drivers=virgl,zink,softpipe \
+            -Dvulkan-drivers= \
+            -Dglx=dri \
+            -Dplatforms=x11 \
+            -Dllvm=disabled \
+            -Dbuildtype=release \
+            -Dc_args='-O3 -march=armv9-a -mcpu=cortex-x2+cortex-a710 -I./src/vulkan/util' \
+            -Dcpp_args='-O3 -march=armv9-a -mcpu=cortex-x2+cortex-a710 -I./src/vulkan/util'
+
+      - name: Execute Cloud Compilation
+        run: |
+          cd mesa
+          ninja -C build-android
+
+      - name: Package Custom Driver Output
+        run: |
+          mkdir output
+          cp mesa/build-android/src/gallium/targets/virgl/libGL.so.1 output/custom_mali_g710_driver.so
+
+      - name: Upload Finished Driver to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dimensity-9000-MaliG710-Driver
+          path: output/custom_mali_g710_driver.so
